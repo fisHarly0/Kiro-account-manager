@@ -1,4 +1,10 @@
 import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut } from 'electron'
+import {
+  applyAccountCredentialUpdate,
+  preserveNewerAccountCredentials,
+  type AccountCredentialUpdate,
+  type AccountDataSnapshot
+} from '../shared/accountCredentials'
 import { autoUpdater } from 'electron-updater'
 import * as machineIdModule from './machineId'
 import { join } from 'path'
@@ -394,6 +400,8 @@ function initProxyServer(): ProxyServer {
       },
       // 账号更新回调 - 通知渲染进程更新账号数据
       onAccountUpdate: (account) => {
+        // Persist before notifying the UI: the proxy page may not be mounted.
+        persistAccountCredentialUpdate(account)
         mainWindow?.webContents.send('proxy-account-update', {
           id: account.id,
           accessToken: account.accessToken,
@@ -509,15 +517,9 @@ function initProxyServer(): ProxyServer {
   setProfileArnPersistCallback((accountId, profileArn) => {
     try {
       proxyServer?.getAccountPool().updateAccount(accountId, { profileArn })
+      persistAccountCredentialUpdate({ id: accountId, profileArn })
       // 推送 IPC，让 renderer store 把 profileArn 写入账号数据
       mainWindow?.webContents.send('proxy-account-update', { id: accountId, profileArn })
-      // 同步更新内存快照，确保下次整库落盘时带上 profileArn
-      if (lastSavedData && typeof lastSavedData === 'object') {
-        const data = lastSavedData as { accounts?: Record<string, Record<string, unknown>> }
-        if (data.accounts?.[accountId]) {
-          data.accounts[accountId] = { ...data.accounts[accountId], profileArn }
-        }
-      }
       console.log(`[ProxyServer] Persisted Enterprise profileArn for ${accountId}: ${profileArn}`)
     } catch (e) {
       console.warn('[ProxyServer] Failed to persist profileArn:', e)
@@ -1408,6 +1410,28 @@ let store: {
 
 // 最后保存的数据（用于崩溃恢复）
 let lastSavedData: unknown = null
+
+function persistAccountCredentialUpdate(update: AccountCredentialUpdate): void {
+  if (!store) return
+  const data = store.get('accountData') as AccountDataSnapshot | undefined
+  const account = data?.accounts?.[update.id]
+  if (!data || !account) return // An in-flight refresh must not recreate a deleted account.
+  const updated = applyAccountCredentialUpdate(account, update)
+  if (updated === account) return
+  const next = { ...data, accounts: { ...data.accounts, [update.id]: updated } }
+  store.set('accountData', next)
+  lastSavedData = next
+}
+
+function saveAccountSnapshot(data: unknown): unknown {
+  const next = preserveNewerAccountCredentials(
+    data as AccountDataSnapshot,
+    store!.get('accountData') as AccountDataSnapshot | undefined
+  )
+  store!.set('accountData', next)
+  lastSavedData = next
+  return next
+}
 
 async function initStore(): Promise<void> {
   if (store) return
@@ -2343,7 +2367,7 @@ function createWindow(): void {
     if (lastSavedData && store) {
       try {
         console.log('[Window] Saving data before close...')
-        store.set('accountData', lastSavedData)
+        saveAccountSnapshot(lastSavedData)
         // 备份异步进行，不阻塞关闭
         createBackup(lastSavedData).then(() => {
           console.log('[Window] Backup created')
@@ -2957,13 +2981,10 @@ app.whenReady().then(async () => {
   ipcMain.handle('save-accounts', async (_event, data) => {
     try {
       await initStore()
-      store!.set('accountData', data)
-      
-      // 保存最后的数据（用于崩溃恢复）
-      lastSavedData = data
+      const saved = saveAccountSnapshot(data)
       
       // 每次保存时也创建备份
-      await createBackup(data)
+      await createBackup(saved)
     } catch (error) {
       console.error('Failed to save accounts:', error)
       throw error
@@ -7307,7 +7328,7 @@ app.on('will-quit', async (event) => {
       console.log('[Exit] Saving data before quit...')
       // 刷新待写入的防抖数据
       flushStoreWrites()
-      store.set('accountData', lastSavedData)
+      saveAccountSnapshot(lastSavedData)
       // 退出场景跳过节流，确保备份立即落盘
       await createBackup(lastSavedData)
       await flushBackupNow()
